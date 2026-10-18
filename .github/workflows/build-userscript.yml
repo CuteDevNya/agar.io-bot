@@ -1,5 +1,11 @@
 name: Build combined Tampermonkey userscript
 
+# Source and version changes can arrive as separate commits.
+# Serialize builds so two jobs do not race while pushing generated files.
+concurrency:
+  group: combined-userscript-build-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   push:
     branches:
@@ -69,6 +75,14 @@ jobs:
 
           console.log(`Built combined userscript version ${version}`);
           NODE
+
+      - name: Verify JavaScript syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check src/food-radar.js
+          node --check src/food-bot.js
+          node --check dist/agar-io-bot.user.js
 
       - name: Commit generated files
         shell: bash
