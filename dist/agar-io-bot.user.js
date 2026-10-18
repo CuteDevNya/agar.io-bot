@@ -50,6 +50,11 @@
     // The transform is captured directly from the game's 2D canvas.
     let lastWorldTransform = null;
 
+    // Canvas arc() is called thousands of times in some frames.
+    // Probe only every few milliseconds, rather than inspecting every arc.
+    const TRANSFORM_PROBE_INTERVAL_MS = 3;
+    let lastTransformProbeAt = -Infinity;
+
     // Fast lookup for known food coordinates.
     let foodCoordinateIndex = new Set();
     let foodIndexState = null;
@@ -61,10 +66,8 @@
         window.CanvasRenderingContext2D?.prototype ?? null;
 
     const originalArc = canvas2DPrototype?.arc ?? null;
-    const originalTranslate = canvas2DPrototype?.translate ?? null;
 
     let patchedArc = null;
-    let patchedTranslate = null;
 
     // ==================== BINARY HELPERS ====================
 
@@ -321,15 +324,23 @@
         try {
             const canvas = context?.canvas;
 
-            if (!canvas) return;
-
-            // Only inspect Agar.io's game canvas.
             if (
-                canvas !== gameCanvas &&
-                canvas.id !== "canvas"
+                !canvas ||
+                (canvas !== gameCanvas && canvas.id !== "canvas")
             ) {
                 return;
             }
+
+            const probeNow = performance.now();
+
+            if (
+                probeNow - lastTransformProbeAt <
+                TRANSFORM_PROBE_INTERVAL_MS
+            ) {
+                return;
+            }
+
+            lastTransformProbeAt = probeNow;
 
             if (
                 !Number.isFinite(x) ||
@@ -383,7 +394,7 @@
                 canvasWidth: canvas.width,
                 canvasHeight: canvas.height,
 
-                capturedAt: performance.now(),
+                capturedAt: probeNow,
 
                 matchedX: x,
                 matchedY: y,
@@ -431,12 +442,6 @@
             canvas2DPrototype.arc = originalArc;
         }
 
-        if (
-            patchedTranslate &&
-            canvas2DPrototype.translate === patchedTranslate
-        ) {
-            canvas2DPrototype.translate = originalTranslate;
-        }
     }
 
     // Install early, before Agar.io starts drawing frames.
