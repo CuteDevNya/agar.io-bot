@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Agar.io Bot + Food Radar
 // @namespace    local.agario.botbundle
-// @version      0.3.0
+// @version      0.4.0
 // @description  Combined Agar.io food radar and bot
 // @match        https://agar.io/*
 // @match        https://*.agar.io/*
