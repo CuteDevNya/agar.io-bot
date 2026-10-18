@@ -6,7 +6,7 @@
      // =========================================================
 
      const TOGGLE_KEY = "b";
-     const TICK_MS = 100;
+     const TICK_MS = 130;
      const MOUSE_UPDATE_THRESHOLD = 2;
 
      // Stable target selection.
@@ -39,6 +39,13 @@
      const FOOD_CLUSTER_RADIUS = 250;
      const FOOD_CLUSTER_REWARD = 12;
 
+     // Limit expensive risk calculations to the nearest candidates.
+     // Keep the current target in the pool while it remains visible.
+     const MAX_FOOD_CANDIDATES_TO_SCORE = 96;
+
+     // Keep steering away briefly if a threat flickers out between updates.
+     const ESCAPE_RECOVERY_MS = 850;
+
      // Movement.
      const ESCAPE_DISTANCE_MULTIPLIER = 1.3;
      const EDGE_MARGIN = 24;
@@ -67,6 +74,10 @@
      let lastProgressAt = 0;
 
      const blockedTargets = new Map();
+
+     // Escape hysteresis avoids immediately switching back to food.
+     let lastEscapeVector = null;
+     let escapeLockUntil = 0;
 
      // =========================================================
      // HUD
@@ -107,7 +118,7 @@
          if (!hud) return;
 
          hud.textContent =
-             `AGAR BOT 0.3\n` +
+             `AGAR BOT 0.4\n` +
              `Status: ${enabled ? "ON" : "OFF"}\n` +
              `Mode: ${lastMode}\n` +
              `Target: ${lastTarget}\n` +
@@ -576,53 +587,12 @@
      // MULTI-HAZARD ESCAPE
      // =========================================================
 
-     function escapeFromHazards(api, hazards, center) {
-         if (!hazards.length) return false;
-
+     function aimAlongWorldVector(api, center, vectorX, vectorY) {
          const canvas = document.querySelector("#canvas");
-
          if (!canvas) return false;
 
          const rect = canvas.getBoundingClientRect();
-
-         let vectorX = 0;
-         let vectorY = 0;
-
-         for (const hazard of hazards) {
-             const weight = Math.max(0.01, hazard.urgency);
-
-             vectorX += hazard.awayX * weight;
-             vectorY += hazard.awayY * weight;
-         }
-
-         let magnitude = Math.hypot(vectorX, vectorY);
-
-         // If threats surround the player and vectors cancel,
-         // flee directly from the most urgent threat.
-         if (magnitude < 0.05) {
-             const nearest = [...hazards].sort(
-                 (a, b) => b.urgency - a.urgency
-             )[0];
-
-             if (!nearest) return false;
-
-             vectorX = nearest.awayX;
-             vectorY = nearest.awayY;
-             magnitude = Math.hypot(vectorX, vectorY);
-         }
-
-         if (magnitude < 1e-6) return false;
-
-         vectorX /= magnitude;
-         vectorY /= magnitude;
-
-         // Project the escape direction through the tracker's
-         // actual canvas transform.
-         const centerScreen = api.worldToScreen(
-             center.x,
-             center.y
-         );
-
+         const centerScreen = api.worldToScreen(center.x, center.y);
          const probeScreen = api.worldToScreen(
              center.x + vectorX * 100,
              center.y + vectorY * 100
@@ -635,24 +605,68 @@
 
          let screenDX = probeScreen.x - centerScreen.x;
          let screenDY = probeScreen.y - centerScreen.y;
+         const screenLength = Math.hypot(screenDX, screenDY);
 
-         let screenLength = Math.hypot(screenDX, screenDY);
-
-         if (screenLength < 1e-4) return false;
+         if (!Number.isFinite(screenLength) || screenLength < 1e-4) {
+             return false;
+         }
 
          screenDX /= screenLength;
          screenDY /= screenLength;
 
          const escapeDistance =
-             Math.max(rect.width, rect.height) *
-             ESCAPE_DISTANCE_MULTIPLIER;
+             Math.max(rect.width, rect.height) * ESCAPE_DISTANCE_MULTIPLIER;
 
          const target = clampToCanvas(
              centerScreen.x + screenDX * escapeDistance,
              centerScreen.y + screenDY * escapeDistance
          );
 
-         if (!target) return false;
+         return target ? moveMouse(target.x, target.y) : false;
+     }
+
+     function escapeFromHazards(api, hazards, center) {
+         if (!hazards.length) return false;
+
+         let vectorX = 0;
+         let vectorY = 0;
+
+         for (const hazard of hazards) {
+             const weight = Math.max(0.01, hazard.urgency);
+             vectorX += hazard.awayX * weight;
+             vectorY += hazard.awayY * weight;
+         }
+
+         let magnitude = Math.hypot(vectorX, vectorY);
+
+         // If threats surround the player and vectors cancel,
+         // follow the direction away from the most urgent threat.
+         if (magnitude < 0.05) {
+             const nearest = [...hazards].sort(
+                 (a, b) => b.urgency - a.urgency
+             )[0];
+
+             if (!nearest) return false;
+
+             vectorX = nearest.awayX;
+             vectorY = nearest.awayY;
+             magnitude = Math.hypot(vectorX, vectorY);
+         }
+
+         if (!Number.isFinite(magnitude) || magnitude < 1e-6) {
+             return false;
+         }
+
+         vectorX /= magnitude;
+         vectorY /= magnitude;
+
+         if (!aimAlongWorldVector(api, center, vectorX, vectorY)) {
+             return false;
+         }
+
+         // Remember direction briefly to avoid flicker-induced oscillation.
+         lastEscapeVector = { x: vectorX, y: vectorY };
+         escapeLockUntil = Date.now() + ESCAPE_RECOVERY_MS;
 
          const mostUrgent = [...hazards].sort(
              (a, b) => b.urgency - a.urgency
@@ -674,12 +688,30 @@
                  );
 
          lastDetails =
-             `Hazards: ${hazards.length}\n` +
+             `Hazards: ${hazards.length}\\n` +
              `Nearest distance: ${Math.round(
                  Math.min(...hazards.map(h => h.distance))
              )}`;
 
-         return moveMouse(target.x, target.y);
+         return true;
+     }
+
+     function continueEscape(api, center, now) {
+         if (!lastEscapeVector || now >= escapeLockUntil) {
+             return false;
+         }
+
+         lastMode = "Escape recovery";
+         lastTarget = "Maintaining safe distance";
+         lastDetails =
+             `Recovery: ${Math.ceil(escapeLockUntil - now)} ms`;
+
+         return aimAlongWorldVector(
+             api,
+             center,
+             lastEscapeVector.x,
+             lastEscapeVector.y
+         );
      }
 
      // =========================================================
@@ -919,21 +951,38 @@
                  continue;
              }
 
-             visibleFoods.push({ food, screen });
+             visibleFoods.push({ food, screen, distance: distance(food, center) });
          }
 
          const foodGrid = buildFoodGrid(
              visibleFoods.map(item => item.food)
          );
 
-         for (const item of visibleFoods) {
+         // Score only nearby options to reduce repeated enemy-risk
+         // calculations. Keep the current target if still visible.
+         const scoredFoodPool = visibleFoods
+             .slice()
+             .sort((a, b) => a.distance - b.distance)
+             .slice(0, MAX_FOOD_CANDIDATES_TO_SCORE);
+
+         const currentVisibleTarget = visibleFoods.find(
+             item => item.food.id === currentTargetId
+         );
+
+         if (
+             currentVisibleTarget &&
+             !scoredFoodPool.some(
+                 item => item.food.id === currentTargetId
+             )
+         ) {
+             scoredFoodPool.push(currentVisibleTarget);
+         }
+
+         for (const item of scoredFoodPool) {
              const food = item.food;
              const screen = item.screen;
 
-             const travelDistance = distance(
-                 food,
-                 center
-             );
+             const travelDistance = item.distance;
 
              const riskPenalty = getFoodRiskPenalty(
                  food,
@@ -1182,6 +1231,13 @@
                  return;
              }
 
+             // Keep moving away briefly if a hazard temporarily vanished.
+             if (now < escapeLockUntil && lastEscapeVector) {
+                 continueEscape(api, center, now);
+                 updateHUD();
+                 return;
+             }
+
              // -------------------------------------------------
              // 2. SCORE VISIBLE FOOD
              // -------------------------------------------------
@@ -1309,6 +1365,8 @@
 
                  resetProgressTracking();
                  blockedTargets.clear();
+                 lastEscapeVector = null;
+                 escapeLockUntil = 0;
 
                  lastAimX = null;
                  lastAimY = null;
@@ -1335,6 +1393,6 @@
      setInterval(tick, TICK_MS);
 
      console.info(
-         "[Agar Bot] v0.3 ready. Press B to toggle."
+         "[Agar Bot] v0.4 ready. Press B to toggle."
      );
  })();
