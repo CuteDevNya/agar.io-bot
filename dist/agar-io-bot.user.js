@@ -53,7 +53,9 @@
     // Canvas arc() is called thousands of times in some frames.
     // Probe only every few milliseconds, rather than inspecting every arc.
     const TRANSFORM_PROBE_INTERVAL_MS = 3;
+    const ARC_PROBE_STRIDE = 8;
     let lastTransformProbeAt = -Infinity;
+    let arcProbeCounter = 0;
 
     // Fast lookup for known food coordinates.
     let foodCoordinateIndex = new Set();
@@ -410,19 +412,36 @@
         if (!canvas2DPrototype) return;
 
         if (typeof originalArc === "function") {
-            patchedArc = function (x, y, ...rest) {
-                captureWorldTransform(
-                    this,
-                    x,
-                    y,
-                    "arc"
-                );
+            patchedArc = function (
+                x,
+                y,
+                radius,
+                startAngle,
+                endAngle,
+                counterclockwise
+            ) {
+                // Keep the hot path tiny: only inspect every eighth arc.
+                // Food is drawn as many individual circles, so this still
+                // finds matching food coordinates while cutting hook work.
+                arcProbeCounter++;
+
+                if (arcProbeCounter % ARC_PROBE_STRIDE === 0) {
+                    captureWorldTransform(
+                        this,
+                        x,
+                        y,
+                        "arc"
+                    );
+                }
 
                 return originalArc.call(
                     this,
                     x,
                     y,
-                    ...rest
+                    radius,
+                    startAngle,
+                    endAngle,
+                    counterclockwise
                 );
             };
 
