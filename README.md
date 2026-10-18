@@ -15,20 +15,20 @@ If you previously installed the separate Food Bot and Food Radar scripts, disabl
 ## Controls
 
 - **B** — enable/disable the bot.
-- **H** — toggle hunting mode. The bot can target visible player cells that are sufficiently smaller than your largest cell; if no safe prey is found, it returns to food collection.
-- **J** — toggle optional auto-split attacks. This also enables hunting mode. Split attempts are conservative and only occur when the size and on-screen distance thresholds are satisfied. If the current game build does not expose `core.split()`, hunting still works but auto-split cannot activate.
-- Reload Agar.io after installing or updating.
+- **H** — toggle hunting. Hunting starts enabled and is continuously evaluated alongside food collection; turn it off only to focus exclusively on food.
+- **J** — toggle auto-split attacks. Auto-split starts enabled but only attempts an attack when size, distance, cooldown, and target checks qualify. If the current game build does not expose `core.split()`, hunting still works but auto-split cannot activate.
+- **Reload Agar.io** after installing or updating.
 
-## Bot abilities (0.5.0)
+## Bot abilities (0.6.0)
 
-- Food collection with stable target selection.
-- Risk assessment and evasive movement around larger cells.
-- Virus avoidance.
-- Optional hunting and predicted aiming at safely smaller visible players.
-- Optional auto-split attack, disabled by default.
-- Short canvas-transform probe throttling to reduce frame work while preserving the live food-alignment method.
+- Food collection and food-cluster scoring.
+- Continuous opportunistic hunting: the bot compares safe prey against available food every tick instead of treating hunting as a separate mode.
+- Threat assessment and evasive movement around larger cells, with virus avoidance taking priority over chasing prey or food.
+- Predictive aiming at eligible prey.
+- Automatic split attacks when an eligible prey target is sufficiently close and the current game build exposes the split function.
+- Target stability and canvas-transform probe throttling to reduce unnecessary work.
 
-These behaviors use heuristics from the visible cell data; they do not guarantee survival or a successful attack.
+The bot has one movement aim point, so it cannot physically steer toward food and prey in different directions at the exact same moment. It scans both types of targets continuously and chooses the most useful action; immediate danger takes priority. These behaviours are heuristics and do not guarantee survival or a successful attack.
 
 ## Source files
 
@@ -41,6 +41,6 @@ These behaviors use heuristics from the visible cell data; they do not guarantee
 
 ## Publishing an update
 
-Edit the files under `src/` and increase `VERSION` (for example, to `0.6.0`). Push the changes to `main`. GitHub Actions rebuilds the combined userscript and checks JavaScript syntax automatically.
+Edit the files under `src/` and increase `VERSION` (for example, to `0.7.0`). Push the changes to `main`. GitHub Actions rebuilds the combined userscript and checks JavaScript syntax automatically.
 
 Tampermonkey checks for updates according to its configured update interval. Once it has installed the new version, reload Agar.io to run it.
