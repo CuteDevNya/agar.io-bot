@@ -1747,6 +1747,19 @@
      const ESCAPE_DISTANCE_MULTIPLIER = 1.3;
      const EDGE_MARGIN = 24;
 
+     // New ability: opportunistic hunting.
+     const HUNT_SIZE_RATIO = 1.25;
+     const HUNT_LEAD_SECONDS = 0.28;
+     const HUNT_TARGET_LOCK_MS = 900;
+     const HUNT_SWITCH_MARGIN = 0.20;
+     const HUNT_PREDATOR_DANGER_RADIUS = 760;
+
+     // Optional split attack, disabled by default.
+     const AUTO_SPLIT_MIN_RADIUS_RATIO = 1.65;
+     const AUTO_SPLIT_COOLDOWN_MS = 1800;
+     const AUTO_SPLIT_TARGET_RETRY_MS = 10000;
+     const AUTO_SPLIT_SCREEN_RANGE_RATIO = 0.32;
+
      // =========================================================
      // STATE
      // =========================================================
@@ -1775,6 +1788,15 @@
      // Escape hysteresis avoids immediately switching back to food.
      let lastEscapeVector = null;
      let escapeLockUntil = 0;
+
+     let huntMode = false;
+     let autoSplitEnabled = false;
+
+     let currentPreyId = null;
+     let preyLockedAt = 0;
+
+     let lastSplitAt = 0;
+     const splitTriedTargets = new Map();
 
      // =========================================================
      // HUD
@@ -1815,12 +1837,13 @@
          if (!hud) return;
 
          hud.textContent =
-             `AGAR BOT 0.4\n` +
+             `AGAR BOT 0.5\n` +
              `Status: ${enabled ? "ON" : "OFF"}\n` +
              `Mode: ${lastMode}\n` +
              `Target: ${lastTarget}\n` +
+             `Hunt: ${huntMode ? "ON" : "OFF"} | Split: ${autoSplitEnabled ? "ON" : "OFF"}\n` +
              `${lastDetails || lastError || ""}\n` +
-             `[B] Toggle bot`;
+             `[B] Bot  [H] Hunt  [J] Auto-split`;
      }
 
      // =========================================================
@@ -1830,19 +1853,9 @@
      function blockManualMouseMovement(event) {
          if (!enabled || !event.isTrusted) return;
 
-         const canvas = document.querySelector("#canvas");
-         if (!canvas) return;
-
-         const path =
-             typeof event.composedPath === "function"
-                 ? event.composedPath()
-                 : [];
-
-         const isGameMouseEvent =
-             event.target === canvas ||
-             path.includes(canvas);
-
-         if (!isGameMouseEvent) return;
+         // Agar.io's gameplay input comes from the game canvas.
+         // Avoid querySelector() and composedPath() on every mouse event.
+         if (event.target?.id !== "canvas") return;
 
          event.preventDefault();
          event.stopImmediatePropagation();
@@ -2822,6 +2835,251 @@
      }
 
      // =========================================================
+     // HUNTING MODE
+     // =========================================================
+
+     function resetHuntTarget() {
+         currentPreyId = null;
+         preyLockedAt = 0;
+     }
+
+     function findHuntCandidates(api, center, myCells, enemies, rect, now) {
+         const largestOwnRadius = myCells.reduce(
+             (max, cell) => Math.max(max, cell.radius),
+             0
+         );
+
+         if (largestOwnRadius <= 0) return [];
+
+         const candidates = [];
+
+         for (const enemy of enemies) {
+             if (
+                 !validCell(enemy) ||
+                 !isFreshCell(enemy, 900, now) ||
+                 largestOwnRadius < enemy.radius * HUNT_SIZE_RATIO
+             ) {
+                 continue;
+             }
+
+             // Lead the aim slightly when the tracker's velocity estimate is fresh.
+             const predicted = predictPosition(
+                 enemy,
+                 HUNT_LEAD_SECONDS,
+                 now
+             );
+
+             const screen = api.worldToScreen(
+                 predicted.x,
+                 predicted.y
+             );
+
+             if (!screen) continue;
+
+             if (
+                 screen.x < rect.left + 6 ||
+                 screen.x > rect.right - 6 ||
+                 screen.y < rect.top + 6 ||
+                 screen.y > rect.bottom - 6
+             ) {
+                 continue;
+             }
+
+             const travelDistance = distance(center, predicted);
+             let predatorPenalty = 0;
+
+             // Penalize prey positioned close to a cell capable of eating us.
+             for (const other of enemies) {
+                 if (other.id === enemy.id || !validCell(other)) continue;
+
+                 if (other.radius < largestOwnRadius * DANGER_SIZE_RATIO) {
+                     continue;
+                 }
+
+                 const predatorDistance = distance(other, predicted);
+
+                 if (predatorDistance < HUNT_PREDATOR_DANGER_RADIUS) {
+                     predatorPenalty +=
+                         (1 - predatorDistance / HUNT_PREDATOR_DANGER_RADIUS) *
+                         900;
+                 }
+             }
+
+             const reward = Math.min(
+                 enemy.radius,
+                 largestOwnRadius * 0.75
+             ) * 0.55;
+
+             const score =
+                 travelDistance +
+                 predatorPenalty -
+                 reward;
+
+             candidates.push({
+                 enemy,
+                 aimPoint: predicted,
+                 screen,
+                 distance: travelDistance,
+                 predatorPenalty,
+                 score,
+                 ownRadius: largestOwnRadius,
+                 sizeRatio: largestOwnRadius / enemy.radius
+             });
+         }
+
+         candidates.sort((a, b) => a.score - b.score);
+         return candidates;
+     }
+
+     function selectStablePrey(candidates, now) {
+         if (!candidates.length) {
+             resetHuntTarget();
+             return null;
+         }
+
+         const best = candidates[0];
+         const current = candidates.find(
+             candidate => candidate.enemy.id === currentPreyId
+         );
+
+         let chosen = best;
+
+         if (current && current.enemy.id !== best.enemy.id) {
+             const lockAge = now - preyLockedAt;
+             const switchThreshold = Math.max(
+                 70,
+                 Math.abs(current.score) * HUNT_SWITCH_MARGIN
+             );
+
+             const clearlyBetter =
+                 best.score < current.score - switchThreshold;
+
+             if (
+                 lockAge < HUNT_TARGET_LOCK_MS ||
+                 !clearlyBetter
+             ) {
+                 chosen = current;
+             }
+         } else if (current) {
+             chosen = current;
+         }
+
+         if (currentPreyId !== chosen.enemy.id) {
+             currentPreyId = chosen.enemy.id;
+             preyLockedAt = now;
+         }
+
+         return chosen;
+     }
+
+     // =========================================================
+     // OPTIONAL AUTO-SPLIT ATTACK
+     // =========================================================
+
+     function getSplitCapableCore() {
+         try {
+             if (
+                 typeof core !== "undefined" &&
+                 core &&
+                 typeof core.split === "function"
+             ) {
+                 return core;
+             }
+         } catch {
+             // Continue to the window property fallback.
+         }
+
+         if (
+             window.core &&
+             typeof window.core.split === "function"
+         ) {
+             return window.core;
+         }
+
+         return null;
+     }
+
+     function tryAutoSplitAttack(api, target, myCells, rect, now) {
+         if (!autoSplitEnabled || !target) return false;
+
+         for (const [id, expiry] of splitTriedTargets) {
+             if (expiry <= now) splitTriedTargets.delete(id);
+         }
+
+         if (
+             now - lastSplitAt < AUTO_SPLIT_COOLDOWN_MS ||
+             splitTriedTargets.has(target.enemy.id)
+         ) {
+             return false;
+         }
+
+         const eligibleCells = myCells.filter(cell =>
+             validCell(cell) &&
+             cell.radius >=
+                 target.enemy.radius * AUTO_SPLIT_MIN_RADIUS_RATIO
+         );
+
+         if (!eligibleCells.length) return false;
+
+         const screenTarget = target.screen;
+         let nearestScreenDistance = Infinity;
+
+         for (const mine of eligibleCells) {
+             const screenMine = api.worldToScreen(mine.x, mine.y);
+
+             if (!screenMine) continue;
+
+             nearestScreenDistance = Math.min(
+                 nearestScreenDistance,
+                 distance(screenMine, screenTarget)
+             );
+         }
+
+         const splitRange = clamp(
+             Math.min(rect.width, rect.height) *
+                 AUTO_SPLIT_SCREEN_RANGE_RATIO,
+             180,
+             360
+         );
+
+         if (nearestScreenDistance > splitRange) return false;
+
+         const gameCore = getSplitCapableCore();
+
+         if (!gameCore) {
+             lastDetails =
+                 "Hunt works; split() is not exposed by this game build";
+             return false;
+         }
+
+         try {
+             // The mouse is already aimed at the prey this tick.
+             gameCore.split();
+
+             lastSplitAt = now;
+             splitTriedTargets.set(
+                 target.enemy.id,
+                 now + AUTO_SPLIT_TARGET_RETRY_MS
+             );
+
+             lastMode = "Split attack";
+             lastTarget =
+                 target.enemy.name ||
+                 "Cell " + target.enemy.id;
+
+             lastDetails =
+                 "Size ratio: " + target.sizeRatio.toFixed(2) + "x\n" +
+                 "Aim distance: " + Math.round(nearestScreenDistance) + " px";
+
+             return true;
+         } catch (error) {
+             lastError =
+                 "Split failed: " + String(error?.message || error);
+             return false;
+         }
+     }
+
+     // =========================================================
      // MAIN BOT TICK
      // =========================================================
 
@@ -2935,10 +3193,6 @@
                  return;
              }
 
-             // -------------------------------------------------
-             // 2. SCORE VISIBLE FOOD
-             // -------------------------------------------------
-
              const canvas = document.querySelector("#canvas");
 
              if (!canvas) {
@@ -2948,6 +3202,60 @@
              }
 
              const rect = canvas.getBoundingClientRect();
+
+             // -------------------------------------------------
+             // 2. HUNT MODE: PRIORITIZE SAFELY EDIBLE PREY
+             // -------------------------------------------------
+
+             if (huntMode) {
+                 const preyCandidates = findHuntCandidates(
+                     api,
+                     center,
+                     myCells,
+                     enemies,
+                     rect,
+                     now
+                 );
+
+                 const prey = selectStablePrey(
+                     preyCandidates,
+                     now
+                 );
+
+                 if (prey) {
+                     lastMode = "Hunting prey";
+                     lastTarget =
+                         prey.enemy.name ||
+                         "Cell " + prey.enemy.id;
+
+                     lastDetails =
+                         "Size ratio: " + prey.sizeRatio.toFixed(2) + "x\n" +
+                         "Distance: " + Math.round(prey.distance) + "\n" +
+                         "Nearby predator risk: " + Math.round(prey.predatorPenalty);
+
+                     moveMouse(
+                         prey.screen.x,
+                         prey.screen.y
+                     );
+
+                     if (autoSplitEnabled) {
+                         tryAutoSplitAttack(
+                             api,
+                             prey,
+                             myCells,
+                             rect,
+                             now
+                         );
+                     }
+
+                     updateHUD();
+                     return;
+                 }
+             }
+
+             // -------------------------------------------------
+             // 3. SCORE VISIBLE FOOD
+             // -------------------------------------------------
 
              const candidates = getFoodCandidates(
                  api,
@@ -2991,7 +3299,7 @@
              // 4. MOVE TOWARDS THE CHOSEN TARGET
              // -------------------------------------------------
 
-             lastMode = "Collecting food";
+             lastMode = huntMode ? "Foraging (no safe prey)" : "Collecting food";
              lastTarget = `Food ${target.food.id}`;
 
              lastDetails =
@@ -3047,38 +3355,75 @@
                  return;
              }
 
-             if (
-                 event.key.toLowerCase() === TOGGLE_KEY
-             ) {
+             const key = event.key.toLowerCase();
+
+             if (key === TOGGLE_KEY) {
                  enabled = !enabled;
 
-                 lastMode = enabled
-                     ? "Starting"
-                     : "Disabled";
-
+                 lastMode = enabled ? "Starting" : "Disabled";
                  lastTarget = "None";
                  lastError = "";
                  lastDetails = "";
 
                  resetProgressTracking();
+                 resetHuntTarget();
                  blockedTargets.clear();
+                 splitTriedTargets.clear();
+
                  lastEscapeVector = null;
                  escapeLockUntil = 0;
-
                  lastAimX = null;
                  lastAimY = null;
 
                  updateHUD(true);
 
                  console.info(
-                     `[Agar Bot] ${
-                         enabled ? "Enabled" : "Disabled"
-                     }`
+                     `[Agar Bot] ${enabled ? "Enabled" : "Disabled"}`
+                 );
+
+             } else if (key === "h") {
+                 huntMode = !huntMode;
+                 resetHuntTarget();
+
+                 lastMode = huntMode
+                     ? "Hunt mode enabled"
+                     : "Food mode enabled";
+
+                 lastDetails =
+                     "H toggles hunting for safely smaller cells";
+
+                 updateHUD(true);
+
+                 console.info(
+                     `[Agar Bot] Hunt mode ${huntMode ? "enabled" : "disabled"}`
+                 );
+
+             } else if (key === "j") {
+                 autoSplitEnabled = !autoSplitEnabled;
+
+                 if (autoSplitEnabled) {
+                     huntMode = true;
+                     resetHuntTarget();
+                 }
+
+                 lastMode = autoSplitEnabled
+                     ? "Auto-split enabled"
+                     : "Auto-split disabled";
+
+                 lastDetails =
+                     "J toggles split attacks; only favorable targets qualify";
+
+                 updateHUD(true);
+
+                 console.info(
+                     `[Agar Bot] Auto-split ${autoSplitEnabled ? "enabled" : "disabled"}`
                  );
              }
          },
          true
      );
+
+     
 
      // =========================================================
      // START
@@ -3090,6 +3435,6 @@
      setInterval(tick, TICK_MS);
 
      console.info(
-         "[Agar Bot] v0.4 ready. Press B to toggle."
+         "[Agar Bot] v0.5 ready. B=bot, H=hunt, J=auto-split."
      );
  })();
