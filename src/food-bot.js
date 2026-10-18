@@ -57,7 +57,13 @@
      const HUNT_SWITCH_MARGIN = 0.20;
      const HUNT_PREDATOR_DANGER_RADIUS = 760;
 
-     // Optional split attack, disabled by default.
+     // Balance hunting against efficient food collection.
+     const HUNT_FOOD_SCORE_ADVANTAGE = 110;
+     const HUNT_OBJECTIVE_HYSTERESIS = 140;
+     const HUNT_CLOSE_DISTANCE_RATIO = 0.78;
+     const HUNT_MAX_PREDATOR_PENALTY = 420;
+
+     // Optional split attack.
      const AUTO_SPLIT_MIN_RADIUS_RATIO = 1.65;
      const AUTO_SPLIT_COOLDOWN_MS = 1800;
      const AUTO_SPLIT_TARGET_RETRY_MS = 10000;
@@ -92,8 +98,11 @@
      let lastEscapeVector = null;
      let escapeLockUntil = 0;
 
-     let huntMode = false;
-     let autoSplitEnabled = false;
+     // Start with all core behaviours enabled. The planner chooses its
+     // single movement direction from the best objective each tick.
+     let huntMode = true;
+     let autoSplitEnabled = true;
+     let currentObjective = "food";
 
      let currentPreyId = null;
      let preyLockedAt = 0;
@@ -140,7 +149,7 @@
          if (!hud) return;
 
          hud.textContent =
-             `AGAR BOT 0.5\n` +
+             `AGAR BOT 0.6\n` +
              `Status: ${enabled ? "ON" : "OFF"}\n` +
              `Mode: ${lastMode}\n` +
              `Target: ${lastTarget}\n` +
@@ -1382,6 +1391,33 @@
          }
      }
 
+     // Choose between prey and food every tick. Escaping remains the
+     // highest priority; hunting is opportunistic rather than exclusive.
+     function shouldHuntPrey(prey, bestFood) {
+         if (!prey) return false;
+         if (!bestFood) return true;
+
+         const requiredAdvantage = Math.max(
+             HUNT_FOOD_SCORE_ADVANTAGE,
+             Math.min(220, Math.abs(bestFood.score) * 0.10)
+         );
+
+         const clearlyBetterUseOfTime =
+             prey.score + requiredAdvantage < bestFood.score;
+
+         const closeAndLowRisk =
+             prey.distance <= bestFood.distance * HUNT_CLOSE_DISTANCE_RATIO &&
+             prey.predatorPenalty < HUNT_MAX_PREDATOR_PENALTY;
+
+         const keepCurrentHunt =
+             currentObjective === "prey" &&
+             prey.score <= bestFood.score + HUNT_OBJECTIVE_HYSTERESIS;
+
+         return clearlyBetterUseOfTime ||
+             closeAndLowRisk ||
+             keepCurrentHunt;
+     }
+
      // =========================================================
      // MAIN BOT TICK
      // =========================================================
@@ -1507,60 +1543,29 @@
              const rect = canvas.getBoundingClientRect();
 
              // -------------------------------------------------
-             // 2. HUNT MODE: PRIORITIZE SAFELY EDIBLE PREY
+             // 2. EVALUATE ALL OBJECTIVES EVERY TICK
              // -------------------------------------------------
+             // There is only one mouse aim point, so movement cannot
+             // literally head in multiple directions at once. Instead,
+             // danger, edible prey, food clusters, and split opportunities
+             // are evaluated continuously and the best action wins.
 
-             if (huntMode) {
-                 const preyCandidates = findHuntCandidates(
+             const preyCandidates = huntMode
+                 ? findHuntCandidates(
                      api,
                      center,
                      myCells,
                      enemies,
                      rect,
                      now
-                 );
+                 )
+                 : [];
 
-                 const prey = selectStablePrey(
-                     preyCandidates,
-                     now
-                 );
+             const prey = huntMode
+                 ? selectStablePrey(preyCandidates, now)
+                 : null;
 
-                 if (prey) {
-                     lastMode = "Hunting prey";
-                     lastTarget =
-                         prey.enemy.name ||
-                         "Cell " + prey.enemy.id;
-
-                     lastDetails =
-                         "Size ratio: " + prey.sizeRatio.toFixed(2) + "x\n" +
-                         "Distance: " + Math.round(prey.distance) + "\n" +
-                         "Nearby predator risk: " + Math.round(prey.predatorPenalty);
-
-                     moveMouse(
-                         prey.screen.x,
-                         prey.screen.y
-                     );
-
-                     if (autoSplitEnabled) {
-                         tryAutoSplitAttack(
-                             api,
-                             prey,
-                             myCells,
-                             rect,
-                             now
-                         );
-                     }
-
-                     updateHUD();
-                     return;
-                 }
-             }
-
-             // -------------------------------------------------
-             // 3. SCORE VISIBLE FOOD
-             // -------------------------------------------------
-
-             const candidates = getFoodCandidates(
+             const foodCandidates = getFoodCandidates(
                  api,
                  center,
                  allCells,
@@ -1571,44 +1576,82 @@
                  now
              );
 
-             // -------------------------------------------------
-             // 3. KEEP A STABLE TARGET
-             // -------------------------------------------------
+             const bestFood = foodCandidates.length
+                 ? foodCandidates[0]
+                 : null;
 
-             const target = selectStableTarget(
-                 candidates,
-                 now
-             );
-
-             if (!target) {
-                 lastMode = "Searching";
-                 lastTarget = "No suitable food";
-
-                 // Stop continuing towards a stale target.
-                 moveMouse(
-                     rect.left + rect.width / 2,
-                     rect.top + rect.height / 2
-                 );
+             if (shouldHuntPrey(prey, bestFood)) {
+                 currentObjective = "prey";
+                 lastMode = "Hunting (food scanning active)";
+                 lastTarget =
+                     prey.enemy.name ||
+                     "Cell " + prey.enemy.id;
 
                  lastDetails =
-                     `Visible food: ${candidates.length}\n` +
-                     "Searching for a better route";
+                     "Size ratio: " + prey.sizeRatio.toFixed(2) + "x\n" +
+                     "Prey distance: " + Math.round(prey.distance) + "\n" +
+                     "Predator risk: " + Math.round(prey.predatorPenalty) + "\n" +
+                     "Food options scanned: " + foodCandidates.length;
+
+                 moveMouse(
+                     prey.screen.x,
+                     prey.screen.y
+                 );
+
+                 if (autoSplitEnabled) {
+                     tryAutoSplitAttack(
+                         api,
+                         prey,
+                         myCells,
+                         rect,
+                         now
+                     );
+                 }
 
                  updateHUD();
                  return;
              }
 
              // -------------------------------------------------
-             // 4. MOVE TOWARDS THE CHOSEN TARGET
+             // 3. FOOD COLLECTION WHEN IT BEATS THE HUNT OPTION
              // -------------------------------------------------
 
-             lastMode = huntMode ? "Foraging (no safe prey)" : "Collecting food";
+             const target = selectStableTarget(
+                 foodCandidates,
+                 now
+             );
+
+             if (!target) {
+                 currentObjective = "searching";
+                 lastMode = "Searching";
+                 lastTarget = "No suitable food or safe prey";
+
+                 moveMouse(
+                     rect.left + rect.width / 2,
+                     rect.top + rect.height / 2
+                 );
+
+                 lastDetails =
+                     `Visible food scored: ${foodCandidates.length}\n` +
+                     (huntMode
+                         ? "No sufficiently attractive prey target"
+                         : "Hunting disabled");
+
+                 updateHUD();
+                 return;
+             }
+
+             currentObjective = "food";
+             lastMode = huntMode
+                 ? "Foraging (hunting scan active)"
+                 : "Collecting food";
              lastTarget = `Food ${target.food.id}`;
 
              lastDetails =
                  `Distance: ${Math.round(target.distance)}\n` +
                  `Risk: ${Math.round(target.riskPenalty)} | ` +
-                 `Cluster: ${Math.round(target.clusterReward)}`;
+                 `Cluster: ${Math.round(target.clusterReward)}\n` +
+                 `Prey scan: ${preyCandidates.length} candidate(s)`;
 
              moveMouse(
                  target.screen.x,
@@ -1738,6 +1781,6 @@
      setInterval(tick, TICK_MS);
 
      console.info(
-         "[Agar Bot] v0.5 ready. B=bot, H=hunt, J=auto-split."
+         "[Agar Bot] v0.6 ready. B=bot, H=hunt toggle, J=auto-split toggle."
      );
  })();
