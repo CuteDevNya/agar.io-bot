@@ -1,0 +1,86 @@
+name: Build combined Tampermonkey userscript
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/food-radar.js'
+      - 'src/food-bot.js'
+      - 'VERSION'
+      - '.github/workflows/build-userscript.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build combined userscript and update metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const version = fs.readFileSync("VERSION", "utf8").trim();
+          if (!/^\d+\.\d+\.\d+$/.test(version)) {
+            throw new Error("VERSION must use numeric MAJOR.MINOR.PATCH format");
+          }
+
+          const radar = fs.readFileSync("src/food-radar.js", "utf8").trim();
+          const bot = fs.readFileSync("src/food-bot.js", "utf8").trim();
+
+          if (!radar || !bot) {
+            throw new Error("A source file is empty");
+          }
+
+          const base = "https://raw.githubusercontent.com/CuteDevNya/agar.io-bot/main/dist";
+          const metadata = [
+            "// ==UserScript==",
+            "// @name         Agar.io Bot + Food Radar",
+            "// @namespace    local.agario.botbundle",
+            `// @version      ${version}`,
+            "// @description  Combined Agar.io food radar and bot",
+            "// @match        https://agar.io/*",
+            "// @match        https://*.agar.io/*",
+            "// @run-at       document-start",
+            "// @grant        none",
+            `// @updateURL    ${base}/agar-io-bot.meta.js`,
+            `// @downloadURL  ${base}/agar-io-bot.user.js`,
+            "// ==/UserScript=="
+          ].join("\n");
+
+          const bundle =
+            metadata + "\n\n" +
+            "/* ==================== FOOD RADAR ==================== */\n" +
+            radar + "\n\n" +
+            "/* ==================== FOOD BOT ==================== */\n" +
+            bot + "\n";
+
+          fs.writeFileSync("dist/agar-io-bot.user.js", bundle, "utf8");
+          fs.writeFileSync("dist/agar-io-bot.meta.js", metadata + "\n", "utf8");
+
+          console.log(`Built combined userscript version ${version}`);
+          NODE
+
+      - name: Commit generated files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist/agar-io-bot.user.js dist/agar-io-bot.meta.js
+
+          if git diff --cached --quiet; then
+            echo "Generated files already up to date."
+          else
+            git commit -m "Build combined userscript"
+            git push
+          fi
